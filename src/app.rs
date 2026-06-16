@@ -372,6 +372,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/icon-512.png", get(icon_512_png))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth_check).post(auth_login))
+        .route("/api/auto", get(auth_check).post(auth_login))
         .route("/api/codecs", get(codecs))
         .route("/api/encoders", get(encoders))
         .route(
@@ -705,12 +706,17 @@ async fn healthz() -> impl IntoResponse {
 
 async fn auth_check(
     headers: HeaderMap,
+    Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<&'static str, (StatusCode, String)> {
     let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, None, session_token.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     Ok("ok")
 }
