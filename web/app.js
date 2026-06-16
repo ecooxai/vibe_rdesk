@@ -241,6 +241,8 @@ const state = {
   authenticated: false,
   sessionPasswd: "",
   connecting: false,
+  connectGeneration: 0,
+  pendingProtocolReconnect: false,
   remoteScreenWidth: null,
   remoteScreenHeight: null,
   videoFrameWidth: null,
@@ -1111,6 +1113,25 @@ function reconnectWithCurrentStreamSettings(reason) {
     if (state.connecting || isConnected()) return;
     void connect();
   }, 150);
+}
+
+function closeOpenedTransport(opened) {
+  if (!opened) return;
+  for (const socket of Object.values(opened.sockets || {})) {
+    if (!socket) continue;
+    socket.onclose = null;
+    socket.onerror = null;
+    try {
+      socket.close();
+    } catch {
+      // Ignore close errors while discarding a stale connection attempt.
+    }
+  }
+  try {
+    opened.transport?.close();
+  } catch {
+    // Ignore close errors while discarding a stale connection attempt.
+  }
 }
 
 function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
@@ -2767,6 +2788,8 @@ function handleMicSocketMessage(event) {
 
 async function connect() {
   if (state.connecting) return;
+  const connectGeneration = state.connectGeneration;
+  let opened;
   state.apiOrigin = normalizeApiOrigin(authOriginInput.value || state.apiOrigin);
   saveApiOrigin(state.apiOrigin);
   const needsLogin = !state.authenticated;
@@ -2795,6 +2818,7 @@ async function connect() {
     );
     await setAudioOutputMode(settingsBeforeConnect.audioUseRealOutput, { silent: true });
     closeConnection({ manual: false, preserveStatus: true });
+    if (connectGeneration !== state.connectGeneration) return;
     state.manualDisconnect = false;
     clearReconnectTimer();
     void primeAudioPlayback();
@@ -2821,12 +2845,15 @@ async function connect() {
     const protocol = selectedTransportProtocol();
     state.transportProtocol = protocol;
     renderTransportProtocol();
-    let opened;
     if (protocol === TRANSPORT_WEBTRANSPORT) {
       opened = await openWebTransportRoleSockets(settings);
     } else {
       opened = openWebSocketRoleSockets(settings);
       await opened.openPromise;
+    }
+    if (connectGeneration !== state.connectGeneration || protocol !== selectedTransportProtocol()) {
+      closeOpenedTransport(opened);
+      return;
     }
     state.webTransport = opened.transport || null;
     state.activeTransportProtocol = protocol;
@@ -2862,6 +2889,10 @@ async function connect() {
     maybeScheduleSettingsReconnect();
     void refreshWebClients();
   } catch (error) {
+    if (connectGeneration !== state.connectGeneration) {
+      closeOpenedTransport(opened);
+      return;
+    }
     const message = error.message || String(error);
     closeConnection({ manual: false, preserveStatus: true });
     if (needsLogin || isAuthFailureMessage(message)) {
@@ -2878,6 +2909,14 @@ async function connect() {
     setStatus(isConnected() ? "Connected" : "Disconnected");
   } finally {
     state.connecting = false;
+    if (state.pendingProtocolReconnect) {
+      state.pendingProtocolReconnect = false;
+      if (!isConnected()) {
+        setTimeout(() => {
+          if (!state.connecting && !isConnected()) void connect();
+        }, 0);
+      }
+    }
   }
 }
 
@@ -5987,8 +6026,13 @@ function initControls() {
   transportProtocolSelect?.addEventListener("change", () => {
     state.transportProtocol = selectedTransportProtocol();
     saveTransportProtocolPreference(state.transportProtocol);
+    state.connectGeneration += 1;
     renderTransportProtocol();
-    if (isConnectionOpen() || state.connecting) {
+    if (state.connecting) {
+      state.pendingProtocolReconnect = true;
+      closeConnection({ manual: false, preserveStatus: true, keepCameraEnabled: true });
+      setStatus(`Switching to ${state.transportProtocol}...`);
+    } else if (isConnectionOpen()) {
       reconnectWithCurrentStreamSettings(`Switching to ${state.transportProtocol}...`);
     }
   });
