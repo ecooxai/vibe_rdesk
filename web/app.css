@@ -796,6 +796,24 @@ button.view-size-chip:active {
   line-height: 1.15;
 }
 
+.metric-value-small {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.metric-select {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.26);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.82rem;
+}
+
 .metric-inline-row {
   display: flex;
   align-items: baseline;

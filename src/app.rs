@@ -22,6 +22,9 @@ use std::{
 use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
+use wtransport::{
+    Endpoint, Identity, ServerConfig as WebTransportServerConfig, endpoint::IncomingSession,
+};
 
 use crate::{
     camera::CameraRelay,
@@ -32,7 +35,7 @@ use crate::{
     },
     ffmpeg,
     media::MediaHub,
-    session::{self, SessionRole},
+    session::{self, SessionRole, SessionTransport},
     settings::{
         AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
         ServerConfig, StreamConfig, VideoPerformanceConfig, VideoScale,
@@ -265,6 +268,36 @@ struct WsQuery {
     passwd: Option<String>,
 }
 
+fn stream_configs_from_query(query: &WsQuery) -> (StreamConfig, AudioStreamConfig) {
+    let config = StreamConfig {
+        codec: query.codec.unwrap_or(CodecKind::H264),
+        bitrate_kbps: query
+            .bitrate_kbps
+            .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
+        fps: query.fps.unwrap_or_else(|| StreamConfig::default().fps),
+        encode_preference: query.encode_preference.unwrap_or_default(),
+        performance: VideoPerformanceConfig {
+            encoder_latency: query.encoder_latency.unwrap_or_default(),
+            encoder_quality: query.encoder_quality.unwrap_or_default(),
+            gop_ms: query
+                .gop_ms
+                .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),
+            buffer_ms: query
+                .buffer_ms
+                .unwrap_or_else(|| VideoPerformanceConfig::default().buffer_ms),
+            scale: query
+                .scale
+                .unwrap_or_else(|| VideoPerformanceConfig::default().scale),
+        },
+    }
+    .normalized();
+    let audio_config = AudioStreamConfig {
+        bitrate_kbps: query.audio_bitrate_kbps.unwrap_or(128),
+    }
+    .normalized();
+    (config, audio_config)
+}
+
 #[derive(Debug, Deserialize)]
 struct WebClientsQuery {
     client_id: Option<String>,
@@ -361,7 +394,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             get(get_remote_clipboard).post(set_remote_clipboard),
         )
         .layer(middleware::from_fn(cors))
-        .with_state(state);
+        .with_state(state.clone());
     let listeners = bind
         .split(',')
         .map(str::trim)
@@ -377,8 +410,19 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let listen_addrs = listeners
+        .iter()
+        .map(tokio::net::TcpListener::local_addr)
+        .collect::<Result<Vec<_>, _>>()?;
     info!("listening on {}", listen_urls.join(", "));
     let result = if let Some((cert_path, key_path)) = tls_paths {
+        start_webtransport_servers(
+            state.clone(),
+            listen_addrs.clone(),
+            PathBuf::from(cert_path.clone()),
+            PathBuf::from(key_path.clone()),
+        )
+        .await;
         let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
         let handles = listeners
             .iter()
@@ -434,6 +478,136 @@ pub async fn run(server: ServerConfig) -> Result<()> {
     media.shutdown().await;
     result?;
     Ok(())
+}
+
+async fn start_webtransport_servers(
+    state: Arc<AppState>,
+    addrs: Vec<SocketAddr>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+) {
+    let identity = match Identity::load_pemfiles(&cert_path, &key_path).await {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(error = %err, "webtransport disabled: failed to load TLS identity");
+            return;
+        }
+    };
+
+    for addr in addrs {
+        let config = WebTransportServerConfig::builder()
+            .with_bind_address(addr)
+            .with_identity(identity.clone_identity())
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .build();
+        match Endpoint::server(config) {
+            Ok(endpoint) => {
+                info!("webtransport listening on https://{addr}/wt");
+                let state = state.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let incoming = endpoint.accept().await;
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_webtransport_session(state, incoming).await {
+                                warn!(error = %err, "webtransport session ended with an error");
+                            }
+                        });
+                    }
+                });
+            }
+            Err(err) => {
+                warn!(addr = %addr, error = %err, "webtransport disabled on listener");
+            }
+        }
+    }
+}
+
+async fn handle_webtransport_session(
+    state: Arc<AppState>,
+    incoming: IncomingSession,
+) -> Result<()> {
+    let request = incoming.await?;
+    let path = request.path().to_owned();
+    if !path.starts_with("/wt") {
+        request.not_found().await;
+        return Ok(());
+    }
+    let peer_addr = request.remote_address();
+    let session_query = parse_ws_query_from_path(&path)?;
+    let session_token = request
+        .headers()
+        .get("cookie")
+        .and_then(|cookie| cookie_session_token_from_str(cookie));
+    if let Err((status, message)) = state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            session_query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await
+    {
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => request.too_many_requests().await,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => request.forbidden().await,
+            _ => request.forbidden().await,
+        }
+        warn!(status = %status, message, "rejected webtransport session");
+        return Ok(());
+    }
+
+    let connection = request.accept().await?;
+    loop {
+        let (sender, receiver) = match connection.accept_bi().await {
+            Ok(stream) => stream,
+            Err(err) => {
+                warn!(error = %err, "webtransport accept stream failed");
+                break;
+            }
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_webtransport_stream(state, peer_addr, sender, receiver).await {
+                warn!(error = %err, "webtransport stream ended with an error");
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_webtransport_stream(
+    state: Arc<AppState>,
+    peer_addr: SocketAddr,
+    sender: wtransport::stream::SendStream,
+    mut receiver: wtransport::stream::RecvStream,
+) -> Result<()> {
+    let init = session::read_webtransport_text_frame(&mut receiver).await?;
+    let query: WsQuery = serde_json::from_str(&init)?;
+    let (config, audio_config) = stream_configs_from_query(&query);
+    let role = query.role.unwrap_or_default();
+    let client_id = query
+        .client_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let lease = state.clients.register(client_id, peer_addr, role).await;
+    let close_rx = lease.close_rx.clone();
+    let _lease = lease;
+    session::handle_socket(
+        SessionTransport::WebTransport { sender, receiver },
+        state.server.clone(),
+        state.media.clone(),
+        config,
+        audio_config,
+        role,
+        close_rx,
+    )
+    .await
+}
+
+fn parse_ws_query_from_path(path: &str) -> Result<WsQuery> {
+    let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
+    Ok(serde_urlencoded::from_str(query)?)
 }
 
 fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener> {
@@ -695,32 +869,7 @@ async fn ws(
     {
         return response.into_response();
     }
-    let config = StreamConfig {
-        codec: query.codec.unwrap_or(CodecKind::H264),
-        bitrate_kbps: query
-            .bitrate_kbps
-            .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
-        fps: query.fps.unwrap_or_else(|| StreamConfig::default().fps),
-        encode_preference: query.encode_preference.unwrap_or_default(),
-        performance: VideoPerformanceConfig {
-            encoder_latency: query.encoder_latency.unwrap_or_default(),
-            encoder_quality: query.encoder_quality.unwrap_or_default(),
-            gop_ms: query
-                .gop_ms
-                .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),
-            buffer_ms: query
-                .buffer_ms
-                .unwrap_or_else(|| VideoPerformanceConfig::default().buffer_ms),
-            scale: query
-                .scale
-                .unwrap_or_else(|| VideoPerformanceConfig::default().scale),
-        },
-    }
-    .normalized();
-    let audio_config = AudioStreamConfig {
-        bitrate_kbps: query.audio_bitrate_kbps.unwrap_or(128),
-    }
-    .normalized();
+    let (config, audio_config) = stream_configs_from_query(&query);
     let role = query.role.unwrap_or_default();
     let client_id = query
         .client_id
@@ -731,21 +880,21 @@ async fn ws(
     ws.max_message_size(WS_MAX_MESSAGE_SIZE)
         .max_frame_size(WS_MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| async move {
-        let _lease = lease;
-        if let Err(err) = session::handle_socket(
-            socket,
-            state.server.clone(),
-            state.media.clone(),
-            config,
-            audio_config,
-            role,
-            close_rx,
-        )
-        .await
-        {
-            warn!(error = %err, "websocket session ended with an error");
-        }
-    })
+            let _lease = lease;
+            if let Err(err) = session::handle_socket(
+                SessionTransport::WebSocket(socket),
+                state.server.clone(),
+                state.media.clone(),
+                config,
+                audio_config,
+                role,
+                close_rx,
+            )
+            .await
+            {
+                warn!(error = %err, "websocket session ended with an error");
+            }
+        })
 }
 
 async fn webclients(
@@ -1101,6 +1250,10 @@ fn apply_cors_headers(headers: &mut HeaderMap, origin: Option<&str>) {
 
 fn cookie_session_token(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_session_token_from_str(cookie)
+}
+
+fn cookie_session_token_from_str(cookie: &str) -> Option<String> {
     cookie.split(';').find_map(|item| {
         let (name, value) = item.trim().split_once('=')?;
         (name == "vibe_rdesk_session").then(|| value.to_string())

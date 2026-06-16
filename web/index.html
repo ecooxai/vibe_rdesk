@@ -323,6 +323,14 @@
                     <span class="metric-label">Encoder</span>
                     <strong id="encoder-status" class="metric-value">Not connected</strong>
                   </article>
+                  <article class="metric-card">
+                    <label class="metric-label" for="transport-protocol">Protocol</label>
+                    <select id="transport-protocol" class="metric-select" aria-label="Protocol">
+                      <option value="websocket">websocket</option>
+                      <option value="webtransport">webtransport</option>
+                    </select>
+                    <strong id="status-transport-protocol" class="metric-value metric-value-small">websocket</strong>
+                  </article>
                   <article class="metric-card metric-card-wide webclients-card">
                     <button id="webclients-toggle" class="webclients-toggle secondary" type="button" aria-expanded="false">
                       <span>

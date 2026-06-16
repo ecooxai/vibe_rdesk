@@ -26,6 +26,13 @@ const RECOVERY_TAP_WINDOW_MS = 1600;
 const RECOVERY_TAP_SAME_AREA_PX = 70;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MOBILE_KEYBOARD_COMPOSITION_IDLE_FLUSH_MS = 700;
+const TRANSPORT_PROTOCOL_STORAGE_KEY = "vibe_rdesk.transport_protocol";
+const TRANSPORT_WEBSOCKET = "websocket";
+const TRANSPORT_WEBTRANSPORT = "webtransport";
+const WT_FRAME_TEXT = 0;
+const WT_FRAME_BINARY = 1;
+const WT_FRAME_CLOSE = 2;
+const WT_FRAME_HEADER_BYTES = 5;
 const DEFAULT_MAX_VIDEO_DECODE_QUEUE = 6;
 const MAX_AUDIO_DECODE_QUEUE = 24;
 const AUDIO_MIN_BUFFER_SECONDS = 0.05;
@@ -123,6 +130,9 @@ const state = {
   videoSocket: null,
   audioSocket: null,
   micSocket: null,
+  webTransport: null,
+  transportProtocol: TRANSPORT_WEBSOCKET,
+  activeTransportProtocol: TRANSPORT_WEBSOCKET,
   decoder: null,
   audioDecoder: null,
   audioContext: null,
@@ -346,6 +356,8 @@ const statusCpu = $("status-cpu");
 const statusRam = $("status-ram");
 const statusSwap = $("status-swap");
 const statusLatency = $("status-latency");
+const transportProtocolSelect = $("transport-protocol");
+const statusTransportProtocol = $("status-transport-protocol");
 const statusSpeedDownload = $("status-speed-download");
 const statusSpeedUpload = $("status-speed-upload");
 const statusAudioBuffer = $("status-audio-buffer");
@@ -1179,6 +1191,99 @@ function webSocketUrl(path) {
   const url = apiUrl(path);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url;
+}
+
+function webTransportUrl(path) {
+  const url = apiUrl(path);
+  url.protocol = "https:";
+  return url;
+}
+
+function webTransportSupported() {
+  return typeof WebTransport === "function" && window.isSecureContext;
+}
+
+function webTransportUnavailableMessage() {
+  if (typeof WebTransport !== "function") {
+    return "WebTransport is not available in this browser.";
+  }
+  if (!window.isSecureContext) {
+    return "WebTransport requires a secure HTTPS context.";
+  }
+  return "";
+}
+
+function normalizeTransportProtocol(value) {
+  return value === TRANSPORT_WEBTRANSPORT ? TRANSPORT_WEBTRANSPORT : TRANSPORT_WEBSOCKET;
+}
+
+function loadTransportProtocolPreference() {
+  const wtParam = new URLSearchParams(window.location.search).get("wt");
+  if (wtParam === "1" || wtParam === "true" || wtParam === TRANSPORT_WEBTRANSPORT) {
+    return TRANSPORT_WEBTRANSPORT;
+  }
+  if (wtParam === "0" || wtParam === "false" || wtParam === "ws" || wtParam === TRANSPORT_WEBSOCKET) {
+    return TRANSPORT_WEBSOCKET;
+  }
+  try {
+    return normalizeTransportProtocol(localStorage.getItem(TRANSPORT_PROTOCOL_STORAGE_KEY));
+  } catch {
+    return TRANSPORT_WEBSOCKET;
+  }
+}
+
+function saveTransportProtocolPreference(protocol) {
+  try {
+    localStorage.setItem(TRANSPORT_PROTOCOL_STORAGE_KEY, normalizeTransportProtocol(protocol));
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+function selectedTransportProtocol() {
+  return normalizeTransportProtocol(transportProtocolSelect?.value || state.transportProtocol);
+}
+
+function renderTransportProtocol() {
+  if (transportProtocolSelect) {
+    const webTransportOption = Array.from(transportProtocolSelect.options)
+      .find((option) => option.value === TRANSPORT_WEBTRANSPORT);
+    if (webTransportOption) {
+      webTransportOption.disabled = false;
+      webTransportOption.title = webTransportUnavailableMessage();
+    }
+    transportProtocolSelect.value = state.transportProtocol;
+  }
+  if (statusTransportProtocol) {
+    statusTransportProtocol.textContent = state.activeTransportProtocol || state.transportProtocol;
+  }
+}
+
+function appendWebTransportSessionQuery(url) {
+  if (state.sessionId) {
+    url.searchParams.set("client_id", state.sessionId);
+  }
+  if (state.sessionPasswd) {
+    url.searchParams.set("passwd", state.sessionPasswd);
+  }
+  return url;
+}
+
+function webTransportRoleInit(role, settings) {
+  return {
+    client_id: state.sessionId,
+    role,
+    codec: settings.codec,
+    bitrate_kbps: settings.bitrate,
+    audio_bitrate_kbps: settings.audioBitrateKbps,
+    fps: settings.fps,
+    encode_preference: settings.encodePreference,
+    encoder_latency: settings.encoderLatency,
+    encoder_quality: settings.encoderQuality,
+    scale: settings.videoScale,
+    gop_ms: settings.gopMs,
+    buffer_ms: settings.bufferMs,
+  };
 }
 
 function audioOutputModeLabel(useRealOutput) {
@@ -2274,6 +2379,132 @@ function roleWebSocketUrl(role, settings) {
   return url;
 }
 
+function encodeWtFrame(kind, data = new Uint8Array()) {
+  const payload = data instanceof Uint8Array ? data : new Uint8Array(data);
+  const frame = new Uint8Array(WT_FRAME_HEADER_BYTES + payload.byteLength);
+  const view = new DataView(frame.buffer);
+  view.setUint8(0, kind);
+  view.setUint32(1, payload.byteLength, false);
+  frame.set(payload, WT_FRAME_HEADER_BYTES);
+  return frame;
+}
+
+class WebTransportRoleSocket {
+  constructor(role, stream) {
+    this.role = role;
+    this.readyState = WebSocket.CONNECTING;
+    this.protocol = TRANSPORT_WEBTRANSPORT;
+    this.onmessage = null;
+    this.onclose = null;
+    this.onerror = null;
+    this.reader = stream.readable.getReader();
+    this.writer = stream.writable.getWriter();
+    this.writeQueue = Promise.resolve();
+    this.readBuffer = new Uint8Array(0);
+  }
+
+  async open(init) {
+    await this.writeFrame(WT_FRAME_TEXT, new TextEncoder().encode(JSON.stringify(init)));
+    this.readyState = WebSocket.OPEN;
+    this.readLoop();
+    return this;
+  }
+
+  send(data) {
+    const write = async () => {
+      if (this.readyState !== WebSocket.OPEN) return;
+      if (typeof data === "string") {
+        await this.writeFrame(WT_FRAME_TEXT, new TextEncoder().encode(data));
+        return;
+      }
+      if (data instanceof ArrayBuffer) {
+        await this.writeFrame(WT_FRAME_BINARY, new Uint8Array(data));
+        return;
+      }
+      if (ArrayBuffer.isView(data)) {
+        await this.writeFrame(WT_FRAME_BINARY, new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        return;
+      }
+      if (data instanceof Blob) {
+        await this.writeFrame(WT_FRAME_BINARY, new Uint8Array(await data.arrayBuffer()));
+      }
+    };
+    this.writeQueue = this.writeQueue.then(write).catch((error) => this.fail(error));
+  }
+
+  close() {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSING;
+    this.writeQueue = this.writeQueue
+      .then(() => this.writeFrame(WT_FRAME_CLOSE))
+      .catch(() => {})
+      .finally(() => {
+        this.writer.close().catch(() => {});
+        this.markClosed(1000);
+      });
+  }
+
+  async writeFrame(kind, payload) {
+    await this.writer.write(encodeWtFrame(kind, payload));
+  }
+
+  async readLoop() {
+    try {
+      while (true) {
+        const { value, done } = await this.reader.read();
+        if (done) {
+          this.markClosed(1000);
+          return;
+        }
+        this.appendReadBuffer(value);
+        while (this.readBuffer.byteLength >= WT_FRAME_HEADER_BYTES) {
+          const view = new DataView(this.readBuffer.buffer, this.readBuffer.byteOffset, this.readBuffer.byteLength);
+          const kind = view.getUint8(0);
+          const length = view.getUint32(1, false);
+          const total = WT_FRAME_HEADER_BYTES + length;
+          if (this.readBuffer.byteLength < total) break;
+          const payload = this.readBuffer.slice(WT_FRAME_HEADER_BYTES, total);
+          this.readBuffer = this.readBuffer.slice(total);
+          if (kind === WT_FRAME_CLOSE) {
+            this.markClosed(4000);
+            return;
+          }
+          if (kind === WT_FRAME_TEXT) {
+            this.onmessage?.({ data: new TextDecoder().decode(payload) });
+          } else if (kind === WT_FRAME_BINARY) {
+            this.onmessage?.({ data: payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) });
+          }
+        }
+      }
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  appendReadBuffer(chunk) {
+    if (!this.readBuffer.byteLength) {
+      this.readBuffer = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      return;
+    }
+    const next = new Uint8Array(this.readBuffer.byteLength + chunk.byteLength);
+    next.set(this.readBuffer, 0);
+    next.set(chunk, this.readBuffer.byteLength);
+    this.readBuffer = next;
+  }
+
+  fail(error) {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.onerror?.(error);
+    this.markClosed(1006);
+  }
+
+  markClosed(code = 1000) {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.onclose?.({ code, reason: code === 4000 ? "closed_by_server" : "" });
+  }
+}
+
 function createClientSessionId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
@@ -2329,6 +2560,72 @@ function openRoleSocket(role, settings, onMessage) {
   return { socket, openPromise };
 }
 
+async function openWebTransportRoleSockets(settings) {
+  if (!webTransportSupported()) {
+    throw new Error(webTransportUnavailableMessage() || "This browser does not support WebTransport in this context");
+  }
+  const url = appendWebTransportSessionQuery(webTransportUrl("/wt"));
+  let transport;
+  try {
+    transport = new WebTransport(url);
+  } catch (error) {
+    throw new Error(`WebTransport unavailable: ${error.message || String(error)}`);
+  }
+  try {
+    await transport.ready;
+    transport.closed.catch(() => {});
+    const roleSpecs = [
+      ["control", handleControlSocketMessage],
+      ["input", handleControlSocketMessage],
+      ["video", handleMediaSocketMessage],
+      ["audio", handleMediaSocketMessage],
+      ["mic", handleMicSocketMessage],
+    ];
+    const sockets = {};
+    for (const [role, onMessage] of roleSpecs) {
+      const stream = await transport.createBidirectionalStream();
+      const socket = new WebTransportRoleSocket(role, stream);
+      socket.onmessage = onMessage;
+      socket.onerror = () => showToast("wt_error", `${role} WebTransport error`);
+      socket.onclose = (event) => handleRoleSocketClose(role, event);
+      await socket.open(webTransportRoleInit(role, settings));
+      sockets[role] = socket;
+    }
+    return { transport, sockets };
+  } catch (error) {
+    try {
+      transport.close();
+    } catch {
+      // Ignore cleanup failures before surfacing the connection error.
+    }
+    throw error;
+  }
+}
+
+function openWebSocketRoleSockets(settings) {
+  const control = openRoleSocket("control", settings, handleControlSocketMessage);
+  const input = openRoleSocket("input", settings, handleControlSocketMessage);
+  const video = openRoleSocket("video", settings, handleMediaSocketMessage);
+  const audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
+  const mic = openRoleSocket("mic", settings, handleMicSocketMessage);
+  return {
+    sockets: {
+      control: control.socket,
+      input: input.socket,
+      video: video.socket,
+      audio: audio.socket,
+      mic: mic.socket,
+    },
+    openPromise: Promise.all([
+      control.openPromise,
+      input.openPromise,
+      video.openPromise,
+      audio.openPromise,
+      mic.openPromise,
+    ]),
+  };
+}
+
 function handleRoleSocketClose(role, event) {
   if (state.manualDisconnect) return;
   if (event.code === 4000) {
@@ -2339,7 +2636,7 @@ function handleRoleSocketClose(role, event) {
   }
   setStatus("Disconnected");
   if (event.code && event.code !== 1000 && !state.reconnectTimer) {
-    showToast("ws_closed", `${role} WebSocket closed (${event.code})`);
+    showToast("transport_closed", `${role} ${state.activeTransportProtocol} closed (${event.code})`);
   }
   closeConnection({ manual: false, preserveStatus: true });
   scheduleReconnect();
@@ -2521,23 +2818,24 @@ async function connect() {
     setStatus("Connecting...");
     setEncoderStatus("Connecting...");
     state.sessionId = createClientSessionId();
-    const control = openRoleSocket("control", settings, handleControlSocketMessage);
-    const input = openRoleSocket("input", settings, handleControlSocketMessage);
-    const video = openRoleSocket("video", settings, handleMediaSocketMessage);
-    const audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
-    const mic = openRoleSocket("mic", settings, handleMicSocketMessage);
-    state.socket = control.socket;
-    state.inputSocket = input.socket;
-    state.videoSocket = video.socket;
-    state.audioSocket = audio.socket;
-    state.micSocket = mic.socket;
-    await Promise.all([
-      control.openPromise,
-      input.openPromise,
-      video.openPromise,
-      audio.openPromise,
-      mic.openPromise,
-    ]);
+    const protocol = selectedTransportProtocol();
+    state.transportProtocol = protocol;
+    renderTransportProtocol();
+    let opened;
+    if (protocol === TRANSPORT_WEBTRANSPORT) {
+      opened = await openWebTransportRoleSockets(settings);
+    } else {
+      opened = openWebSocketRoleSockets(settings);
+      await opened.openPromise;
+    }
+    state.webTransport = opened.transport || null;
+    state.activeTransportProtocol = protocol;
+    state.socket = opened.sockets.control;
+    state.inputSocket = opened.sockets.input;
+    state.videoSocket = opened.sockets.video;
+    state.audioSocket = opened.sockets.audio;
+    state.micSocket = opened.sockets.mic;
+    renderTransportProtocol();
     markAppliedStreamSettings(settings);
     state.reconnectAttempt = 0;
     state.reconnectingForLatency = false;
@@ -2572,7 +2870,10 @@ async function connect() {
       setAuthPrompt(message || "Authentication failed");
     } else {
       showToast("connect_failed", message);
-      if (!state.manualDisconnect) scheduleReconnect();
+      setEncoderStatus("Not connected");
+      if (!state.manualDisconnect && selectedTransportProtocol() !== TRANSPORT_WEBTRANSPORT) {
+        scheduleReconnect();
+      }
     }
     setStatus(isConnected() ? "Connected" : "Disconnected");
   } finally {
@@ -2623,11 +2924,13 @@ function closeConnection({ manual = true, preserveStatus = false, keepCameraEnab
   state.netKbps = 0;
   resetKeys();
   const sockets = [state.socket, state.inputSocket, state.videoSocket, state.audioSocket, state.micSocket];
+  const webTransport = state.webTransport;
   state.socket = null;
   state.inputSocket = null;
   state.videoSocket = null;
   state.audioSocket = null;
   state.micSocket = null;
+  state.webTransport = null;
   for (const socket of sockets) {
     if (!socket) continue;
     socket.onclose = null;
@@ -2639,6 +2942,15 @@ function closeConnection({ manual = true, preserveStatus = false, keepCameraEnab
       // Ignore close errors while replacing a connection.
     }
   }
+  if (webTransport) {
+    try {
+      webTransport.close();
+    } catch {
+      // Ignore close errors while replacing a connection.
+    }
+  }
+  state.activeTransportProtocol = state.transportProtocol;
+  renderTransportProtocol();
   if (!preserveStatus) setEncoderStatus("Not connected");
   if (!preserveStatus) setStatus("Disconnected");
   if (!preserveStatus) resetStatusMetrics();
@@ -5672,6 +5984,14 @@ function initControls() {
   });
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
+  transportProtocolSelect?.addEventListener("change", () => {
+    state.transportProtocol = selectedTransportProtocol();
+    saveTransportProtocolPreference(state.transportProtocol);
+    renderTransportProtocol();
+    if (isConnectionOpen() || state.connecting) {
+      reconnectWithCurrentStreamSettings(`Switching to ${state.transportProtocol}...`);
+    }
+  });
   micToggle.addEventListener("click", toggleMicDeviceMenu);
   micDeviceMenu.addEventListener("click", (event) => event.stopPropagation());
   cameraToggle.addEventListener("click", () => {
@@ -5930,6 +6250,8 @@ async function registerAppServiceWorker() {
 
 updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
+state.transportProtocol = loadTransportProtocolPreference();
+state.activeTransportProtocol = state.transportProtocol;
 renderClipboardHistory();
 syncMobileKeyboardButton();
 setActiveTab("status");
@@ -5939,6 +6261,7 @@ applyCanvasZoom();
 resetStatusMetrics();
 initVideoRenderer();
 initControls();
+renderTransportProtocol();
 void registerAppServiceWorker();
 renderMicToggle();
 renderAudioToggle();

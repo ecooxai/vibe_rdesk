@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::ws::{Message as WsMessage, WebSocket};
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use tokio::{
     time::MissedTickBehavior,
 };
 use tracing::{error, warn};
+use wtransport::stream::{RecvStream as WtRecvStream, SendStream as WtSendStream};
 
 use crate::{
     audio::AudioFrame,
@@ -41,6 +42,35 @@ pub enum SessionRole {
     Input,
 }
 
+pub enum SessionTransport {
+    WebSocket(WebSocket),
+    WebTransport {
+        sender: WtSendStream,
+        receiver: WtRecvStream,
+    },
+}
+
+#[derive(Debug)]
+enum TransportMessage {
+    Text(String),
+    Binary(Bytes),
+    Close,
+}
+
+enum TransportWriter {
+    WebSocket(futures_util::stream::SplitSink<WebSocket, WsMessage>),
+    WebTransport(WtSendStream),
+}
+
+enum TransportReader {
+    WebSocket(futures_util::stream::SplitStream<WebSocket>),
+    WebTransport(WtFrameReader),
+}
+
+struct WtFrameReader {
+    receiver: WtRecvStream,
+}
+
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
@@ -61,6 +91,11 @@ const SMOOTH_WHEEL_UNITS_PER_PIXEL: f64 = 1.0;
 const SMOOTH_WHEEL_LINE_PIXELS: f64 = 40.0;
 const SMOOTH_WHEEL_PAGE_PIXELS: f64 = 800.0;
 const SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE: f64 = 120.0;
+const WT_FRAME_TEXT: u8 = 0;
+const WT_FRAME_BINARY: u8 = 1;
+const WT_FRAME_CLOSE: u8 = 2;
+const WT_FRAME_HEADER_LEN: usize = 5;
+const TRANSPORT_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PointerMotionCommand {
@@ -78,8 +113,131 @@ struct WheelAccumulator {
     y_last_sign: i8,
 }
 
+impl SessionTransport {
+    fn split(self) -> (TransportWriter, TransportReader) {
+        match self {
+            Self::WebSocket(socket) => {
+                let (sender, receiver) = socket.split();
+                (
+                    TransportWriter::WebSocket(sender),
+                    TransportReader::WebSocket(receiver),
+                )
+            }
+            Self::WebTransport { sender, receiver } => (
+                TransportWriter::WebTransport(sender),
+                TransportReader::WebTransport(WtFrameReader { receiver }),
+            ),
+        }
+    }
+}
+
+impl TransportWriter {
+    async fn send(&mut self, message: TransportMessage) -> Result<()> {
+        match self {
+            Self::WebSocket(sender) => {
+                let ws_message = match message {
+                    TransportMessage::Text(text) => WsMessage::Text(text.into()),
+                    TransportMessage::Binary(bytes) => WsMessage::Binary(bytes),
+                    TransportMessage::Close => WsMessage::Close(None),
+                };
+                futures_util::SinkExt::send(sender, ws_message).await?;
+                Ok(())
+            }
+            Self::WebTransport(sender) => send_wt_frame(sender, message).await,
+        }
+    }
+}
+
+impl TransportReader {
+    async fn next_message(&mut self) -> Option<Result<TransportMessage>> {
+        match self {
+            Self::WebSocket(receiver) => match receiver.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    Some(Ok(TransportMessage::Text(text.to_string())))
+                }
+                Some(Ok(WsMessage::Binary(bytes))) => Some(Ok(TransportMessage::Binary(bytes))),
+                Some(Ok(WsMessage::Close(_))) => Some(Ok(TransportMessage::Close)),
+                Some(Ok(_)) => Some(Ok(TransportMessage::Text(String::new()))),
+                Some(Err(err)) => Some(Err(err.into())),
+                None => None,
+            },
+            Self::WebTransport(reader) => reader.next_message().await,
+        }
+    }
+}
+
+impl WtFrameReader {
+    async fn next_message(&mut self) -> Option<Result<TransportMessage>> {
+        let mut header = [0_u8; WT_FRAME_HEADER_LEN];
+        match self.receiver.read_exact(&mut header).await {
+            Ok(()) => {}
+            Err(_) => return None,
+        }
+        let kind = header[0];
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if len > TRANSPORT_MAX_MESSAGE_SIZE {
+            return Some(Err(anyhow::anyhow!(
+                "webtransport frame exceeds message limit"
+            )));
+        }
+        if kind == WT_FRAME_CLOSE {
+            return Some(Ok(TransportMessage::Close));
+        }
+        let mut payload = vec![0_u8; len];
+        if let Err(err) = self.receiver.read_exact(&mut payload).await {
+            return Some(Err(err.into()));
+        }
+        match kind {
+            WT_FRAME_TEXT => match String::from_utf8(payload) {
+                Ok(text) => Some(Ok(TransportMessage::Text(text))),
+                Err(err) => Some(Err(err.into())),
+            },
+            WT_FRAME_BINARY => Some(Ok(TransportMessage::Binary(Bytes::from(payload)))),
+            _ => Some(Err(anyhow::anyhow!(
+                "unknown webtransport frame kind {kind}"
+            ))),
+        }
+    }
+}
+
+pub async fn read_webtransport_text_frame(receiver: &mut WtRecvStream) -> Result<String> {
+    let mut header = [0_u8; WT_FRAME_HEADER_LEN];
+    receiver.read_exact(&mut header).await?;
+    let kind = header[0];
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > TRANSPORT_MAX_MESSAGE_SIZE {
+        anyhow::bail!("webtransport frame exceeds message limit");
+    }
+    if kind != WT_FRAME_TEXT {
+        anyhow::bail!("expected webtransport text init frame");
+    }
+    let mut payload = vec![0_u8; len];
+    receiver.read_exact(&mut payload).await?;
+    Ok(String::from_utf8(payload)?)
+}
+
+async fn send_wt_frame(sender: &mut WtSendStream, message: TransportMessage) -> Result<()> {
+    let (kind, payload): (u8, &[u8]) = match &message {
+        TransportMessage::Text(text) => (WT_FRAME_TEXT, text.as_bytes()),
+        TransportMessage::Binary(bytes) => (WT_FRAME_BINARY, bytes.as_ref()),
+        TransportMessage::Close => (WT_FRAME_CLOSE, &[]),
+    };
+    let len = u32::try_from(payload.len())?;
+    let mut header = [0_u8; WT_FRAME_HEADER_LEN];
+    header[0] = kind;
+    header[1..].copy_from_slice(&len.to_be_bytes());
+    sender.write_all(&header).await?;
+    if !payload.is_empty() {
+        sender.write_all(payload).await?;
+    }
+    if matches!(message, TransportMessage::Close) {
+        let _ = sender.finish().await;
+    }
+    Ok(())
+}
+
 pub async fn handle_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -100,7 +258,7 @@ pub async fn handle_socket(
 }
 
 async fn handle_combined_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -118,8 +276,8 @@ async fn handle_combined_socket(
     let initial_audio = audio_stream
         .as_ref()
         .and_then(|stream| stream.state_rx.borrow().clone());
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -135,7 +293,7 @@ async fn handle_combined_socket(
     .await?;
     if initial_audio.is_none() {
         let _ = out_tx
-            .send(Message::Text(
+            .send(TransportMessage::Text(
                 serde_json::to_string(&ServerMessage::Error {
                     code: "audio_unavailable",
                     message: "Audio capture is unavailable. Install and run PulseAudio/PipeWire with pactl support, or set VIBE_RDESK_AUDIO_SOURCE.".into(),
@@ -144,7 +302,7 @@ async fn handle_combined_socket(
             ))
             .await;
     }
-    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
+    let writer_task = tokio::spawn(write_socket(writer, out_rx, video_rx, audio_rx));
     let stats_task = spawn_stats(out_tx.clone(), video_stream.state_rx.clone());
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
@@ -228,17 +386,17 @@ async fn handle_combined_socket(
 }
 
 async fn handle_control_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     media: MediaHub,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(32);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let writer_task = tokio::spawn(write_control_socket(writer, out_rx));
     let stats_task = spawn_stats(out_tx.clone(), media.video_state_rx());
     let state_task = tokio::spawn(forward_state_hellos(
         out_tx.clone(),
@@ -292,7 +450,7 @@ async fn handle_control_socket(
 }
 
 async fn handle_video_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -302,8 +460,8 @@ async fn handle_video_socket(
     let initial_video = current_video_state(&video_stream.state_rx)?;
     let audio_state_rx = media.audio_state_rx();
     let initial_audio = current_audio_state(Some(&audio_state_rx));
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(1);
     drop(audio_tx);
@@ -317,7 +475,7 @@ async fn handle_video_socket(
         None,
     )
     .await?;
-    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
+    let writer_task = tokio::spawn(write_socket(writer, out_rx, video_rx, audio_rx));
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
         video_tx,
@@ -341,23 +499,23 @@ async fn handle_video_socket(
 }
 
 async fn handle_audio_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     media: MediaHub,
     audio_config: AudioStreamConfig,
     close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(1);
     drop(video_tx);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
-    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
+    let writer_task = tokio::spawn(write_socket(writer, out_rx, video_rx, audio_rx));
     let close_task = tokio::spawn(wait_for_socket_close(receiver));
     let mut audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => stream,
         Err(_) => {
             let _ = out_tx
-                .send(Message::Text(
+                .send(TransportMessage::Text(
                     serde_json::to_string(&ServerMessage::Error {
                         code: "audio_unavailable",
                         message: "Audio capture is unavailable. Install and run PulseAudio/PipeWire with pactl support, or set VIBE_RDESK_AUDIO_SOURCE.".into(),
@@ -382,28 +540,28 @@ async fn handle_audio_socket(
 }
 
 async fn handle_mic_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(8);
-    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(8);
+    let writer_task = tokio::spawn(write_control_socket(writer, out_rx));
     let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx.clone(), server));
     wait_for_mic_tasks(writer_task, recv_task, out_tx, close_rx).await;
     Ok(())
 }
 
 async fn handle_input_socket(
-    socket: WebSocket,
+    socket: SessionTransport,
     server: ServerConfig,
     media: MediaHub,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
-    let (out_tx, out_rx) = mpsc::channel::<Message>(8);
+    let (writer, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<TransportMessage>(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let writer_task = tokio::spawn(write_control_socket(writer, out_rx));
     let mut recv_task = tokio::spawn(handle_client(
         receiver,
         out_tx.clone(),
@@ -450,26 +608,18 @@ async fn wait_for_client_close(close_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn send_server_close(sender: &mpsc::Sender<Message>) {
-    let _ = sender
-        .send(Message::Close(Some(CloseFrame {
-            code: 4000,
-            reason: "closed_by_server".into(),
-        })))
-        .await;
+async fn send_server_close(sender: &mpsc::Sender<TransportMessage>) {
+    let _ = sender.send(TransportMessage::Close).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 async fn write_control_socket(
-    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut control_rx: mpsc::Receiver<Message>,
+    mut writer: TransportWriter,
+    mut control_rx: mpsc::Receiver<TransportMessage>,
 ) {
     while let Some(message) = control_rx.recv().await {
-        let should_close = matches!(message, Message::Close(_));
-        if futures_util::SinkExt::send(&mut ws_sender, message)
-            .await
-            .is_err()
-        {
+        let should_close = matches!(message, TransportMessage::Close);
+        if writer.send(message).await.is_err() {
             break;
         }
         if should_close {
@@ -478,12 +628,10 @@ async fn write_control_socket(
     }
 }
 
-async fn wait_for_socket_close(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-) -> Result<()> {
-    while let Some(message) = receiver.next().await {
+async fn wait_for_socket_close(mut receiver: TransportReader) -> Result<()> {
+    while let Some(message) = receiver.next_message().await {
         match message? {
-            Message::Close(_) => break,
+            TransportMessage::Close => break,
             _ => {}
         }
     }
@@ -491,7 +639,7 @@ async fn wait_for_socket_close(
 }
 
 async fn forward_state_hellos(
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     display: String,
     mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
     mut audio_state_rx: watch::Receiver<Option<ActiveAudioState>>,
@@ -547,17 +695,17 @@ async fn forward_state_hellos(
 }
 
 async fn handle_mic_client(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    sender: mpsc::Sender<Message>,
+    mut receiver: TransportReader,
+    sender: mpsc::Sender<TransportMessage>,
     server: ServerConfig,
 ) -> Result<()> {
     let mut mic_input = MicInputState::Idle;
-    while let Some(message) = receiver.next().await {
+    while let Some(message) = receiver.next_message().await {
         match message? {
-            Message::Binary(bytes) => {
+            TransportMessage::Binary(bytes) => {
                 forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
             }
-            Message::Close(_) => break,
+            TransportMessage::Close => break,
             _ => {}
         }
     }
@@ -570,7 +718,7 @@ async fn wait_for_role_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut send_task: tokio::task::JoinHandle<Result<()>>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
@@ -611,7 +759,7 @@ async fn wait_for_role_tasks(
 async fn wait_for_audio_error_socket(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
@@ -643,7 +791,7 @@ async fn wait_for_audio_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut audio_task: Option<tokio::task::JoinHandle<Result<()>>>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     mut close_rx: watch::Receiver<bool>,
 ) {
     match audio_task.as_mut() {
@@ -694,7 +842,7 @@ async fn wait_for_audio_tasks(
 async fn wait_for_mic_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut recv_task: tokio::task::JoinHandle<Result<()>>,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
@@ -723,7 +871,7 @@ async fn wait_for_mic_tasks(
 }
 
 async fn forward_frames(
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     media_sender: mpsc::Sender<Bytes>,
     mut rx: broadcast::Receiver<StreamFrame>,
     mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
@@ -795,8 +943,8 @@ async fn forward_audio(
 }
 
 async fn write_socket(
-    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut control_rx: mpsc::Receiver<Message>,
+    mut writer: TransportWriter,
+    mut control_rx: mpsc::Receiver<TransportMessage>,
     mut video_rx: mpsc::Receiver<Bytes>,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
 ) {
@@ -809,11 +957,8 @@ async fn write_socket(
     loop {
         match control_rx.try_recv() {
             Ok(message) => {
-                let should_close = matches!(message, Message::Close(_));
-                if futures_util::SinkExt::send(&mut ws_sender, message)
-                    .await
-                    .is_err()
-                {
+                let should_close = matches!(message, TransportMessage::Close);
+                if writer.send(message).await.is_err() {
                     break;
                 }
                 if should_close {
@@ -828,7 +973,8 @@ async fn write_socket(
         }
 
         if let Some(bytes) = pending_audio.take() {
-            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
+            if writer
+                .send(TransportMessage::Binary(bytes.into()))
                 .await
                 .is_err()
             {
@@ -838,10 +984,7 @@ async fn write_socket(
         }
 
         if let Some(bytes) = pending_video.take() {
-            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes))
-                .await
-                .is_err()
-            {
+            if writer.send(TransportMessage::Binary(bytes)).await.is_err() {
                 break;
             }
             continue;
@@ -856,8 +999,8 @@ async fn write_socket(
             maybe = control_rx.recv(), if !control_closed => {
                 match maybe {
                     Some(message) => {
-                        let should_close = matches!(message, Message::Close(_));
-                        if futures_util::SinkExt::send(&mut ws_sender, message).await.is_err() {
+                        let should_close = matches!(message, TransportMessage::Close);
+                        if writer.send(message).await.is_err() {
                             break;
                         }
                         if should_close {
@@ -886,7 +1029,7 @@ async fn write_socket(
 }
 
 fn spawn_stats(
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<TransportMessage>,
     video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -916,7 +1059,11 @@ fn spawn_stats(
             };
             match serde_json::to_string(&msg) {
                 Ok(text) => {
-                    if sender.send(Message::Text(text.into())).await.is_err() {
+                    if sender
+                        .send(TransportMessage::Text(text.into()))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -930,8 +1077,8 @@ fn spawn_stats(
 }
 
 async fn handle_client(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-    sender: mpsc::Sender<Message>,
+    mut receiver: TransportReader,
+    sender: mpsc::Sender<TransportMessage>,
     server: ServerConfig,
     media: MediaHub,
     mut shutdown: watch::Receiver<bool>,
@@ -980,14 +1127,14 @@ async fn handle_client(
                 if let Some(message) = pending_message.take() {
                     Some(Ok(message))
                 } else {
-                    receiver.next().await
+                    receiver.next_message().await
                 }
             } => {
                 let Some(message) = message else {
                     break;
                 };
                 match message? {
-                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                    TransportMessage::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(client) => {
                             let receiver_closed = if is_pointer_motion_message(&client) {
                                 let mut motions = Vec::new();
@@ -1031,11 +1178,10 @@ async fn handle_client(
                         }
                         Err(err) => warn!("invalid client message: {err}"),
                     },
-                    Message::Binary(bytes) => {
+                    TransportMessage::Binary(bytes) => {
                         forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
                     }
-                    Message::Close(_) => break,
-                    _ => {}
+                    TransportMessage::Close => break,
                 }
             }
             changed = shutdown.changed() => {
@@ -1119,21 +1265,21 @@ fn push_pointer_motion_command(commands: &mut Vec<PointerMotionCommand>, message
 }
 
 fn drain_pointer_motion_messages(
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
-    pending_message: &mut Option<Message>,
+    receiver: &mut TransportReader,
+    pending_message: &mut Option<TransportMessage>,
     motions: &mut Vec<PointerMotionCommand>,
 ) -> Result<bool> {
     loop {
-        match receiver.next().now_or_never() {
+        match receiver.next_message().now_or_never() {
             None => return Ok(false),
             Some(None) => return Ok(true),
-            Some(Some(Ok(Message::Text(text)))) => {
+            Some(Some(Ok(TransportMessage::Text(text)))) => {
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client) if is_pointer_motion_message(&client) => {
                         push_pointer_motion_command(motions, &client);
                     }
                     Ok(_) => {
-                        *pending_message = Some(Message::Text(text));
+                        *pending_message = Some(TransportMessage::Text(text));
                         return Ok(false);
                     }
                     Err(err) => warn!("invalid client message: {err}"),
@@ -1339,7 +1485,7 @@ async fn apply_client_message(
     pointer_motion_injector: &mut Option<UInputPointerInjector>,
     input_injector: Option<&X11InputInjector>,
     smooth_wheel_injector: Option<&mut UInputWheelInjector>,
-    sender: &mpsc::Sender<Message>,
+    sender: &mpsc::Sender<TransportMessage>,
     media: &MediaHub,
     message: ClientMessage,
     pressed_keys: &mut HashSet<String>,
@@ -1414,14 +1560,8 @@ async fn apply_client_message(
                     && key_logical_modifier(&key).is_none()
                     && key_modifiers_active(modifiers)
                 {
-                    tap_key_with_modifiers(
-                        display,
-                        input_injector,
-                        pressed_keys,
-                        &key,
-                        modifiers,
-                    )
-                    .await?;
+                    tap_key_with_modifiers(display, input_injector, pressed_keys, &key, modifiers)
+                        .await?;
                     *last_key_state_at = if pressed_keys.is_empty() {
                         None
                     } else {
@@ -1480,7 +1620,7 @@ async fn apply_client_message(
             }
             tokio::time::sleep(Duration::from_millis(80)).await;
             sender
-                .send(Message::Text(
+                .send(TransportMessage::Text(
                     serde_json::to_string(&ServerMessage::Clipboard {
                         side: "remote",
                         payload: payload.clone(),
@@ -1506,7 +1646,7 @@ async fn apply_client_message(
         }
         ClientMessage::Ping { seq } => {
             sender
-                .send(Message::Text(
+                .send(TransportMessage::Text(
                     serde_json::to_string(&ServerMessage::Pong {
                         seq,
                         server_time_ms: current_ms(),
@@ -1527,7 +1667,7 @@ async fn apply_client_message(
                 return Ok(());
             }
             sender
-                .send(Message::Text(
+                .send(TransportMessage::Text(
                     serde_json::to_string(&ServerMessage::Clipboard {
                         side: "remote",
                         payload,
@@ -1868,9 +2008,7 @@ async fn apply_key_event(
         match input_injector.key_event(key, down) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                warn!(
-                    "persistent X11 key event failed for {key}, falling back to xdotool: {err}"
-                );
+                warn!("persistent X11 key event failed for {key}, falling back to xdotool: {err}");
             }
         }
     }
@@ -2274,10 +2412,13 @@ async fn paste_remote_text(
     Ok(())
 }
 
-async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) -> Result<()> {
+async fn send_clipboard_update(
+    display: &str,
+    sender: &mpsc::Sender<TransportMessage>,
+) -> Result<()> {
     let payload = read_remote_clipboard(display).await?;
     sender
-        .send(Message::Text(
+        .send(TransportMessage::Text(
             serde_json::to_string(&ServerMessage::Clipboard {
                 side: "remote",
                 payload,
@@ -2288,7 +2429,7 @@ async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) ->
     Ok(())
 }
 
-fn spawn_clipboard_update(display: String, sender: mpsc::Sender<Message>) {
+fn spawn_clipboard_update(display: String, sender: mpsc::Sender<TransportMessage>) {
     tokio::spawn(async move {
         if let Err(err) = send_clipboard_update(&display, &sender).await {
             warn!("failed to read remote clipboard: {err}");
@@ -2341,7 +2482,7 @@ async fn wait_for_audio_state_change(
 }
 
 async fn send_hello(
-    sender: &mpsc::Sender<Message>,
+    sender: &mpsc::Sender<TransportMessage>,
     session_id: Option<&str>,
     display: Option<&str>,
     video_state: &ActiveVideoState,
@@ -2356,7 +2497,7 @@ async fn send_hello(
         }
     });
     sender
-        .send(Message::Text(
+        .send(TransportMessage::Text(
             serde_json::to_string(&ServerMessage::Hello {
                 session_id: session_id.unwrap_or_default().into(),
                 server_time_ms: current_ms(),
@@ -2393,7 +2534,7 @@ enum MicInputState {
 
 async fn forward_client_binary(
     server: &ServerConfig,
-    sender: &mpsc::Sender<Message>,
+    sender: &mpsc::Sender<TransportMessage>,
     bytes: &[u8],
     mic_input: &mut MicInputState,
 ) {
@@ -2494,7 +2635,11 @@ async fn shutdown_mic_child(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
-async fn send_runtime_error(sender: &mpsc::Sender<Message>, code: &'static str, message: String) {
+async fn send_runtime_error(
+    sender: &mpsc::Sender<TransportMessage>,
+    code: &'static str,
+    message: String,
+) {
     let payload = match serde_json::to_string(&ServerMessage::Error { code, message }) {
         Ok(payload) => payload,
         Err(err) => {
@@ -2502,5 +2647,5 @@ async fn send_runtime_error(sender: &mpsc::Sender<Message>, code: &'static str, 
             return;
         }
     };
-    let _ = sender.send(Message::Text(payload.into())).await;
+    let _ = sender.send(TransportMessage::Text(payload.into())).await;
 }
